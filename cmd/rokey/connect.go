@@ -20,21 +20,21 @@ import (
 	"golang.org/x/term"
 )
 
-// cmdAttach attaches the local terminal to a rokey server, over QUIC with
+// cmdConnect connects the local terminal to a rokey server, over QUIC with
 // mutual TLS (default) or plain TCP. Keys are forwarded verbatim; the detach
 // key (default Ctrl-]) closes the connection and leaves the program running
 // on the server.
-func cmdAttach(args []string) {
-	fs := flag.NewFlagSet("rokey attach", flag.ExitOnError)
+func cmdConnect(args []string) {
+	fs := flag.NewFlagSet("rokey connect", flag.ExitOnError)
 	transport := fs.String("transport", "quic", "transport: quic (mutual TLS over UDP) or tcp (plaintext)")
-	addr := fs.String("connect", "127.0.0.1:7000", "server address (host:port)")
+	addr := fs.String("peer-addr", "127.0.0.1:7000", "server address (host:port)")
 	port := fs.Int("port", 0, "quic: local UDP port (0 = random, set for bilateral punch)")
 	network := fs.String("network", "udp4", "quic: bind network: udp4, udp6, or udp (dual-stack)")
 	peerKey := fs.String("peer-key", "", "quic: expected server fingerprint (required)")
 	keyFile := fs.String("key-file", ".", "quic: key file path ('': ephemeral, '.': persistent user key)")
 	detachFlag := fs.String("detach-key", "0x1d", "byte that detaches the client (Ctrl-] by default); 'none' disables")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: rokey attach [flags]\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: rokey connect [flags]\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)

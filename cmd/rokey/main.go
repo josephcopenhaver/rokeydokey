@@ -1,10 +1,10 @@
 // Command rokey is a keyed remote terminal: `rokey serve` runs one terminal
 // program inside a pseudo-terminal and lets exactly one client, identified
-// by a pinned public key, attach to it with `rokey attach`. The program
-// outlives the client; detach and re-attach at will.
+// by a pinned public key, connect to it with `rokey connect`. The program
+// outlives the client; detach and reconnect at will.
 //
-//	rokey serve  [-peer-key <fp>] [-port N] [-cmd program] [-- args...]
-//	rokey attach [-connect host:port] [-peer-key <fp>]
+//	rokey serve   [-peer-key <fp>] [-port N] [-restart] [-cmd program] [-- args...]
+//	rokey connect [-peer-addr host:port] [-peer-key <fp>]
 //	rokey show-key
 //	rokey rotate-key
 //	rokey version
@@ -28,12 +28,12 @@ func usage() {
 
 Usage:
   rokey serve      Host a terminal program and wait for one pinned client
-  rokey attach     Attach this terminal to a rokey server
+  rokey connect    Connect this terminal to a rokey server
   rokey show-key   Print your persistent public key fingerprint
   rokey rotate-key Generate a new persistent key pair, replacing the old one
   rokey version    Print the version
 
-Run "rokey serve -h" or "rokey attach -h" for flags.
+Run "rokey serve -h" or "rokey connect -h" for flags.
 
 Security:
   - ECDSA P-384 key pair for identity, stored in ~/.rokey/
@@ -53,8 +53,8 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		cmdServe(args)
-	case "attach":
-		cmdAttach(args)
+	case "connect":
+		cmdConnect(args)
 	case "show-key":
 		cmdShowKey()
 	case "rotate-key":

@@ -1,5 +1,8 @@
 .DS_Store
 
+rokey
+main
+
 /bin/
-/vendor
+/vendor/
 *.bak

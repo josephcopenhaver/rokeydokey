@@ -2,22 +2,23 @@
 
 A keyed remote terminal. `rokey serve` runs one terminal program inside a
 pseudo-terminal and lets exactly one client, identified by a pinned public
-key, attach to it with `rokey attach`. The program outlives the client:
+key, connect to it with `rokey connect`. The program outlives the client:
 detach, reconnect, pick up where you left off. The server exits when the
-program exits.
+program exits, unless `-restart` tells it to wait for the next client and
+start the program again.
 
 Think of it as the pty channel of SSH on its own, with [dtach][dtach]-style
-detach and re-attach, carried over QUIC with mutual TLS 1.3 and ECDSA P-384
+detach and reconnect, carried over QUIC with mutual TLS 1.3 and ECDSA P-384
 identity pinning borrowed from [bareshare][bareshare]. No user accounts, no
 shell integration, no port forwarding, no multiplexing yet. Point it at a
 shell, tmux, an editor, or anything else that runs in a terminal.
 
 ```
-┌──────────────┐  keystrokes, resize   ┌─────────────┐  pty   ┌───────────┐
-│ rokey attach │ ────────────────────▶ │ rokey serve │ ─────▶ │  program  │
-│  (raw tty)   │ ◀──────────────────── │             │ ◀───── │ shell,tmux│
-└──────────────┘    screen bytes       └─────────────┘        └───────────┘
-              QUIC + mutual TLS (or plain TCP)
+┌───────────────┐  keystrokes, resize   ┌─────────────┐  pty   ┌───────────┐
+│ rokey connect │ ────────────────────▶ │ rokey serve │ ─────▶ │  program  │
+│  (raw tty)    │ ◀──────────────────── │             │ ◀───── │ shell,tmux│
+└───────────────┘    screen bytes       └─────────────┘        └───────────┘
+               QUIC + mutual TLS (or plain TCP)
 ```
 
 [dtach]: https://github.com/crigler/dtach
@@ -26,8 +27,8 @@ shell, tmux, an editor, or anything else that runs in a terminal.
 ## Layout
 
 - `cmd/rokey` — the one binary. `serve.go` binds UDP (or TCP), starts the
-  program on first attach, and bridges the pty to the one attached client.
-  `attach.go` puts the local terminal in raw mode, forwards keys and
+  program on first connect, and bridges the pty to the one connected client.
+  `connect.go` puts the local terminal in raw mode, forwards keys and
   window-size changes, and writes the program's output to the screen.
 - `internal/secure` — identity keys, fingerprints, pinned mutual-TLS configs,
   QUIC listen/dial, and UDP hole punching. Adapted from bareshare (MIT).
@@ -70,14 +71,15 @@ this fingerprint is fresh each run. Send it to the viewer.
 **Back on the viewer's machine:**
 
 ```
-rokey attach -connect host:7000 -peer-key <server-fingerprint>
+rokey connect -peer-addr host:7000 -peer-key <server-fingerprint>
 ```
 
-`Ctrl-]` detaches and leaves the program running; attaching again picks the
+`Ctrl-]` detaches and leaves the program running; connecting again picks the
 session back up. Change the detach key with `-detach-key 0x1c` (any byte) or
 disable it with `-detach-key none`.
 
-Ctrl-C on the server sends the program SIGTERM; a second Ctrl-C kills it.
+Ctrl-C on the server sends the program SIGTERM and exits the server once the
+program is gone, `-restart` or not; a second Ctrl-C kills the program.
 
 ## Hosting a program
 
@@ -85,17 +87,29 @@ Ctrl-C on the server sends the program SIGTERM; a second Ctrl-C kills it.
 A bare name is looked up on `$PATH`.
 
 ```
-rokey serve -peer-key <fp> -cmd tmux -- new-session -A -s main
+rokey serve -peer-key <fp> -restart -cmd tmux -- new-session -A -s main
 rokey serve -peer-key <fp> -cmd micro -- notes.txt
 rokey serve -peer-key <fp> -cmd htop
 rokey serve -peer-key <fp> -cmd /bin/zsh -- -l
 ```
 
-tmux is the natural pairing. Its own detach (`Ctrl-b d`) ends the tmux
-client, which ends the rokey session, while the tmux server and your windows
-keep running. `new-session -A` re-attaches to them next time.
+tmux is the natural pairing, and the reason `-restart` exists. tmux's own
+detach (`Ctrl-b d`) ends the tmux client, which is the hosted program, so
+without `-restart` the server would exit with it. With `-restart` the server
+keeps listening, and the next `rokey connect` starts a fresh tmux client that
+`new-session -A` re-attaches to your windows. The tmux server and everything
+in it keeps running in between.
 
-Full-screen programs (tmux, editors, htop) repaint on re-attach because the
+Prefer `Ctrl-b d` over `Ctrl-]` with tmux. A fresh tmux client initializes
+your terminal from scratch for the `TERM` and size you connect with:
+alternate screen, keypad and mouse modes, a full redraw. Reconnecting to a
+tmux client that is still running only nudges it with a size change, which
+redraws content but does not replay that terminal setup, so a viewer on a
+different terminal than the first one can see glitches until something
+forces a full redraw. The viewer's machine does not need tmux installed; the
+host needs a terminfo entry for the viewer's `TERM`.
+
+Full-screen programs (tmux, editors, htop) repaint on reconnect because the
 server nudges them with a window-size change. A plain shell doesn't repaint;
 press Enter for a fresh prompt.
 
@@ -104,8 +118,8 @@ press Enter for a fresh prompt.
 For a local or already-tunneled link, skip the keys:
 
 ```
-rokey serve  -transport tcp -listen 127.0.0.1:7000 -cmd tmux -- new-session -A -s main
-rokey attach -transport tcp -connect 127.0.0.1:7000
+rokey serve   -transport tcp -listen 127.0.0.1:7000 -cmd tmux -- new-session -A -s main
+rokey connect -transport tcp -peer-addr 127.0.0.1:7000
 ```
 
 There is no authentication or encryption on this path.
@@ -120,7 +134,7 @@ rokey show-key      # print the persistent fingerprint
 rokey rotate-key    # new key pair; old fingerprint printed for reference
 ```
 
-`serve` and `attach` take `-key-file` with bareshare's convention:
+`serve` and `connect` take `-key-file` with bareshare's convention:
 
 | Value | Behavior |
 |---|---|
@@ -130,30 +144,33 @@ rokey rotate-key    # new key pair; old fingerprint printed for reference
 
 Defaults differ by role. **serve** defaults to ephemeral: its fingerprint is
 fresh per run, so a viewer must obtain it right before connecting and nothing
-persists afterwards. **attach** defaults to persistent, so a server can be
+persists afterwards. **connect** defaults to persistent, so a server can be
 pinned to it once. Pass `-key-file .` to `serve` if you want a stable server
 fingerprint across restarts.
 
 ## NAT traversal
 
 For peers behind NAT, use bilateral UDP hole punching. Both sides must use a
-fixed port and know each other's public address.
+fixed port and know each other's public address. Each side names the other
+with `-peer-addr`.
 
 Server:
 
 ```
-rokey serve -port 7000 -client-addr <client-public-ip:7001> -peer-key <fp>
+rokey serve -port 7000 -peer-addr <client-public-ip:7001> -peer-key <fp>
 ```
 
 Client:
 
 ```
-rokey attach -port 7001 -connect <server-public-ip:7000> -peer-key <fp>
+rokey connect -port 7001 -peer-addr <server-public-ip:7000> -peer-key <fp>
 ```
 
 The server punches toward the client from the same UDP socket QUIC uses, so
-the NAT mapping it opens is the one the session flows through. Punching stops
-once a client is verified.
+the NAT mapping it opens is the one the session flows through. Punching
+pauses while a client is connected, since the session's own keepalives hold
+the mapping open, and resumes as soon as the connection ends so the client
+can come back after its NAT has forgotten the previous session.
 
 ## Network selection
 
@@ -168,20 +185,20 @@ must be reachable over the family in use.
 | both | `-transport` | `quic` | `quic` (mutual TLS over UDP) or `tcp` (plaintext) |
 | both | `-network` | `udp4` | `udp4`, `udp6`, or `udp` |
 | both | `-peer-key` | | expected peer fingerprint; required for quic |
-| both | `-key-file` | serve `""`, attach `.` | ephemeral, persistent, or a path |
+| both | `-key-file` | serve `""`, connect `.` | ephemeral, persistent, or a path |
+| both | `-port` | `0` (random) | serve: UDP port to listen on; connect: local UDP port. Fix both for punching |
 | serve | `-cmd` | `$SHELL`, else `/bin/sh` | program to host; its args follow `--` |
-| serve | `-port` | `0` (random) | UDP port to listen on |
-| serve | `-client-addr` | | client's public `host:port` to punch toward |
+| serve | `-restart` | off | keep serving after the program exits; the next client starts it again |
+| serve | `-peer-addr` | | client's public `host:port` to punch toward |
 | serve | `-listen` | `127.0.0.1:7000` | tcp bind address |
-| attach | `-connect` | `127.0.0.1:7000` | server `host:port` |
-| attach | `-port` | `0` (random) | local UDP port; fix it for punching |
-| attach | `-detach-key` | `0x1d` (Ctrl-]) | byte that detaches |
+| connect | `-peer-addr` | `127.0.0.1:7000` | server `host:port` |
+| connect | `-detach-key` | `0x1d` (Ctrl-]) | byte that detaches |
 
 ## Environment
 
 | variable | default | meaning |
 |---|---|---|
-| `ROKEY_CLOSE_GRACE` | `3s` | How long `serve` waits for a departing client to read its final frame (busy, error, or exit) and hang up before closing the connection. QUIC discards unsent stream data on close, so `0` risks losing that frame. Also bounds how long the server lingers after the program exits. Any Go duration, e.g. `500ms`. |
+| `ROKEY_CLOSE_GRACE` | `3s` | How long `serve` waits for a departing client to read its final frame (busy, error, or exit) and hang up before closing the connection. QUIC discards unsent stream data on close, so `0` risks losing that frame. Also bounds how long the server lingers after the program exits when it is not restarting. Any Go duration, e.g. `500ms`. |
 
 ## Security model
 
@@ -195,8 +212,9 @@ must be reachable over the family in use.
 - **Trust anchor:** the out-of-band channel you exchange fingerprints over.
 - **What the key grants:** the hosted program, running as the user who
   started the server, with that user's environment. A detached session is a
-  live program waiting for whoever holds the pinned client key. Treat the
-  client key like an SSH private key.
+  live program waiting for whoever holds the pinned client key. With
+  `-restart`, so is a server whose program has exited. Treat the client key
+  like an SSH private key.
 
 A client with the wrong key completes its half of the TLS 1.3 handshake
 before the server checks its certificate, so the rejection shows up as the
@@ -214,7 +232,7 @@ Every message on the stream is `type:u8 length:u32be payload`.
 | 3 Exit | server→client | `code:i32` |
 | 4 Error | server→client | message |
 
-Over QUIC this rides one bidirectional stream per attachment. Idle timeout is
+Over QUIC this rides one bidirectional stream per connection. Idle timeout is
 15s with 5s keepalives, so a vanished client frees the session for the next
 one within that window.
 
@@ -222,7 +240,9 @@ one within that window.
 
 - The pty master is switched to blocking mode before use. Go's kqueue-based
   poller does not reliably wake for pty masters on macOS.
-- On re-attach the server sets the pty one column narrower, then back, with a
+- On reconnect the server sets the pty one column narrower, then back, with a
   SIGWINCH each time. Most full-screen programs only repaint on an actual
   size change.
-- The client sends its `TERM`; the host needs a terminfo entry for it.
+- The client sends its `TERM`; the host needs a terminfo entry for it. The
+  program is started with the `TERM` of the client that starts it; later
+  clients inherit that choice until the program exits.

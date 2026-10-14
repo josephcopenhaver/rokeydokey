@@ -50,8 +50,9 @@ func closeGrace() (time.Duration, error) {
 // cmdServe hosts a terminal program (the user's shell by default) inside a
 // pseudo-terminal and exposes it to one client at a time, over QUIC with
 // mutual TLS (default) or plain TCP. The program keeps running when the
-// client disconnects, and a later client re-attaches to the same session.
-// The server exits when the program exits.
+// client disconnects, and a later client reconnects to the same session.
+// The server exits when the program exits, unless -restart is set, in which
+// case the next client starts the program again.
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("rokey serve", flag.ExitOnError)
 	transport := fs.String("transport", "quic", "transport: quic (mutual TLS over UDP) or tcp (plaintext)")
@@ -60,7 +61,8 @@ func cmdServe(args []string) {
 	network := fs.String("network", "udp4", "quic: bind network: udp4, udp6, or udp (dual-stack)")
 	peerKey := fs.String("peer-key", "", "quic: expected client fingerprint (required)")
 	keyFile := fs.String("key-file", "", "quic: key file path (default: ephemeral, '.': persistent user key)")
-	clientAddr := fs.String("client-addr", "", "quic: client's public address for bilateral hole punching")
+	peerAddr := fs.String("peer-addr", "", "quic: client's public address (host:port) to hole punch toward")
+	restart := fs.Bool("restart", false, "keep serving after the program exits; the next client starts it again")
 	program := fs.String("cmd", "", "program to host (default: $SHELL, then /bin/sh); arguments follow after --")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: rokey serve [flags] [-- program args...]\n\nflags:\n")
@@ -76,7 +78,7 @@ func cmdServe(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	srv := &server{bin: bin, args: fs.Args(), done: make(chan int, 1), closeGrace: grace}
+	srv := &server{bin: bin, args: fs.Args(), restart: *restart, done: make(chan int, 1), closeGrace: grace}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -104,14 +106,10 @@ func cmdServe(args []string) {
 		if err != nil {
 			fatal("%v", err)
 		}
-		var stopPunch func()
-		if *clientAddr != "" {
-			stopPunch, err = tr.StartPunch(ctx, *network, *clientAddr)
-			if err != nil {
-				log.Printf("punch toward %s failed: %v (continuing without punch)", *clientAddr, err)
-			} else {
-				log.Printf("punching toward client at %s", *clientAddr)
-			}
+		var punch *puncher
+		if *peerAddr != "" {
+			punch = newPuncher(ctx, tr, *network, *peerAddr)
+			punch.resume()
 		}
 		ln, err := tr.Listen(key, *peerKey)
 		if err != nil {
@@ -119,18 +117,20 @@ func cmdServe(args []string) {
 		}
 		log.Printf("listening on %s port %d (quic, mutual TLS), program %s, args %q", *network, tr.LocalPort(), bin, fs.Args())
 		closeTransport = func() { ln.Close(); tr.Close() }
-		go srv.acceptQUIC(ctx, ln, stopPunch)
+		go srv.acceptQUIC(ctx, ln, punch)
 	default:
 		fatal("invalid -transport %q: must be quic or tcp", *transport)
 	}
 
 	// Forward termination to the program so it can back up and exit cleanly;
-	// the server then exits via the normal "program exited" path.
+	// the server then exits via the normal "program exited" path. With
+	// -restart, marking the server as stopping first makes that exit final.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigs
 		log.Printf("received %v, stopping program", sig)
+		srv.beginShutdown()
 		if !srv.signalProgram(syscall.SIGTERM) {
 			srv.done <- 130
 			return
@@ -144,7 +144,14 @@ func cmdServe(args []string) {
 		}
 	}()
 
-	code := <-srv.done
+	var code int
+	for {
+		code = <-srv.done
+		if !srv.willRestart() {
+			break
+		}
+		log.Printf("program exited with status %d; the next client starts it again", code)
+	}
 	srv.waitForClient(srv.closeGrace)
 	cancel()
 	closeTransport()
@@ -169,7 +176,65 @@ func findProgram(explicit string) (string, error) {
 	return p, nil
 }
 
-// attachment is the one client currently viewing the session.
+// puncher keeps UDP hole punching toward the peer running whenever no QUIC
+// connection is live. Only outbound traffic opens or refreshes the server's
+// NAT mapping, so once a client leaves and the mapping expires, the next
+// connection attempt is dropped at the NAT unless punching has resumed.
+// While a connection is live its keepalives do that job and punching pauses.
+type puncher struct {
+	ctx     context.Context
+	tr      *secure.Transport
+	network string
+	addr    string
+
+	mu   sync.Mutex
+	live int    // accepted QUIC connections that have not ended yet
+	stop func() // non-nil while punching
+}
+
+func newPuncher(ctx context.Context, tr *secure.Transport, network, addr string) *puncher {
+	return &puncher{ctx: ctx, tr: tr, network: network, addr: addr}
+}
+
+// resume starts punching unless a connection is live, punching is already
+// running, or the server is shutting down. The peer address is re-resolved
+// on every resume.
+func (p *puncher) resume() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.live > 0 || p.stop != nil || p.ctx.Err() != nil {
+		return
+	}
+	stop, err := p.tr.StartPunch(p.ctx, p.network, p.addr)
+	if err != nil {
+		log.Printf("punch toward %s failed: %v (continuing without punch)", p.addr, err)
+		return
+	}
+	p.stop = stop
+	log.Printf("punching toward peer at %s", p.addr)
+}
+
+// track pauses punching for the lifetime of an accepted connection and
+// resumes it once the connection ends, however it ends.
+func (p *puncher) track(qc *quic.Conn) {
+	p.mu.Lock()
+	p.live++
+	if p.stop != nil {
+		p.stop()
+		p.stop = nil
+		log.Printf("punching paused while %s is connected", qc.RemoteAddr())
+	}
+	p.mu.Unlock()
+	go func() {
+		<-qc.Context().Done()
+		p.mu.Lock()
+		p.live--
+		p.mu.Unlock()
+		p.resume()
+	}()
+}
+
+// attachment is the one client currently driving the session.
 type attachment struct {
 	w    *proto.Writer
 	rwc  io.ReadWriteCloser
@@ -179,13 +244,15 @@ type attachment struct {
 type server struct {
 	bin        string
 	args       []string
+	restart    bool // -restart: start the program again for the next client after it exits
 	done       chan int
 	closeGrace time.Duration // see closeGraceEnv
 
-	mu     sync.Mutex
-	cmd    *exec.Cmd
-	ptmx   *os.File
-	client *attachment // nil when detached
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	ptmx     *os.File
+	client   *attachment // nil when no client is connected
+	stopping bool        // the server is on its way out; refuses new clients
 }
 
 func (s *server) acceptTCP(ln net.Listener) {
@@ -202,7 +269,7 @@ func (s *server) acceptTCP(ln net.Listener) {
 	}
 }
 
-func (s *server) acceptQUIC(ctx context.Context, ln *quic.Listener, stopPunch func()) {
+func (s *server) acceptQUIC(ctx context.Context, ln *quic.Listener, punch *puncher) {
 	for {
 		qc, err := ln.Accept(ctx)
 		if err != nil {
@@ -212,10 +279,10 @@ func (s *server) acceptQUIC(ctx context.Context, ln *quic.Listener, stopPunch fu
 			log.Printf("accept: %v", err)
 			continue
 		}
-		// The handshake verified the client's fingerprint; stop punching.
-		if stopPunch != nil {
-			stopPunch()
-			stopPunch = nil
+		// The handshake verified the client's fingerprint; its keepalives
+		// hold the NAT mapping open from here until it leaves.
+		if punch != nil {
+			punch.track(qc)
 		}
 		go func() {
 			remote := qc.RemoteAddr().String()
@@ -260,7 +327,7 @@ func (s *server) start(h proto.Hello) error {
 	s.ptmx = ptmx
 	log.Printf("started %s (pid %d) %dx%d TERM=%s", s.bin, cmd.Process.Pid, h.Size.Cols, h.Size.Rows, h.Term)
 
-	// Pump program output to whichever client is attached. This goroutine
+	// Pump program output to whichever client is connected. This goroutine
 	// must always drain the pty so the program never blocks on write.
 	go func() {
 		buf := make([]byte, 32*1024)
@@ -289,19 +356,50 @@ func (s *server) start(h proto.Hello) error {
 				code = 1
 			}
 		}
-		s.mu.Lock()
-		c := s.client
-		s.mu.Unlock()
-		if c != nil {
-			_ = c.w.WriteExit(code)
-			_ = c.rwc.Close() // graceful end of stream after the exit frame
-		}
-		s.done <- code
+		s.programExited(code)
 	}()
 	return nil
 }
 
-// waitForClient gives the attached client's handler up to d to finish, so
+// programExited runs once the program is gone. It releases the pty, tells
+// the connected client, and reports the exit to the main loop. Without
+// -restart the server is now on its way out and admits no new client.
+func (s *server) programExited(code int) {
+	s.mu.Lock()
+	c := s.client
+	ptmx := s.ptmx
+	s.cmd, s.ptmx = nil, nil
+	if !s.restart {
+		s.stopping = true
+	}
+	s.mu.Unlock()
+	if ptmx != nil {
+		_ = ptmx.Close()
+	}
+	if c != nil {
+		_ = c.w.WriteExit(code)
+		_ = c.rwc.Close() // graceful end of stream after the exit frame
+	}
+	s.done <- code
+}
+
+// beginShutdown marks the server as exiting: no new client is admitted and
+// the next program exit is final even with -restart.
+func (s *server) beginShutdown() {
+	s.mu.Lock()
+	s.stopping = true
+	s.mu.Unlock()
+}
+
+// willRestart reports whether a program exit should be followed by waiting
+// for the next client instead of exiting the server.
+func (s *server) willRestart() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restart && !s.stopping
+}
+
+// waitForClient gives the connected client's handler up to d to finish, so
 // the exit frame is delivered before the transport goes away.
 func (s *server) waitForClient(d time.Duration) {
 	s.mu.Lock()
@@ -317,7 +415,7 @@ func (s *server) waitForClient(d time.Duration) {
 }
 
 // signalProgram sends sig to the program. It reports false when no program
-// has been started.
+// is running.
 func (s *server) signalProgram(sig syscall.Signal) bool {
 	s.mu.Lock()
 	cmd := s.cmd
@@ -329,26 +427,33 @@ func (s *server) signalProgram(sig syscall.Signal) bool {
 	return true
 }
 
-// detach drops c if it is the attached client.
+// detach drops c if it is the connected client.
 func (s *server) detach(c *attachment) {
 	s.mu.Lock()
 	if s.client == c {
 		s.client = nil
-		log.Printf("client detached")
+		log.Printf("client disconnected")
 	}
 	s.mu.Unlock()
 }
 
-// resize applies a new window size and nudges the program to redraw even if
-// the size is unchanged (most full-screen programs only repaint on an
-// actual change).
-func (s *server) resize(sz proto.Size, force bool) {
+// program returns the pty and process that att may drive, or nils once att
+// is no longer the connected client or the program has exited. Handlers go
+// through this so a lingering client can never reach a program started for
+// its successor.
+func (s *server) program(att *attachment) (*os.File, *exec.Cmd) {
 	s.mu.Lock()
-	ptmx, cmd := s.ptmx, s.cmd
-	s.mu.Unlock()
-	if ptmx == nil {
-		return
+	defer s.mu.Unlock()
+	if s.client != att {
+		return nil, nil
 	}
+	return s.ptmx, s.cmd
+}
+
+// resizePty applies a new window size and nudges the program to redraw even
+// if the size is unchanged (most full-screen programs only repaint on an
+// actual change).
+func resizePty(ptmx *os.File, cmd *exec.Cmd, sz proto.Size, force bool) {
 	if force && sz.Cols > 1 {
 		if err := pty.Setsize(ptmx, &pty.Winsize{Rows: sz.Rows, Cols: sz.Cols - 1}); err != nil {
 			log.Printf("setsize: %v", err)
@@ -396,9 +501,17 @@ func (s *server) handle(rwc io.ReadWriteCloser, remote string) {
 	}
 
 	s.mu.Lock()
-	if s.client != nil {
+	if s.stopping {
 		s.mu.Unlock()
-		_ = w.WriteError("session busy: another client is attached")
+		_ = w.WriteError("server shutting down")
+		log.Printf("rejected %s: shutting down", remote)
+		return
+	}
+	// A client whose program has already exited but which has not hung up
+	// yet no longer holds the session; the new client takes it over.
+	if s.client != nil && s.cmd != nil {
+		s.mu.Unlock()
+		_ = w.WriteError("session busy: another client is connected")
 		log.Printf("rejected %s: busy", remote)
 		return
 	}
@@ -414,12 +527,14 @@ func (s *server) handle(rwc io.ReadWriteCloser, remote string) {
 	att := &attachment{w: w, rwc: rwc, done: make(chan struct{})}
 	s.client = att
 	s.mu.Unlock()
-	log.Printf("client attached (%dx%d)", hello.Size.Cols, hello.Size.Rows)
+	log.Printf("client connected (%dx%d)", hello.Size.Cols, hello.Size.Rows)
 	defer close(att.done)
 	defer s.detach(att)
 
 	if !fresh {
-		s.resize(hello.Size, true)
+		if ptmx, cmd := s.program(att); ptmx != nil {
+			resizePty(ptmx, cmd, hello.Size, true)
+		}
 	}
 
 	for {
@@ -432,9 +547,7 @@ func (s *server) handle(rwc io.ReadWriteCloser, remote string) {
 		}
 		switch f.Type {
 		case proto.TypeData:
-			s.mu.Lock()
-			ptmx := s.ptmx
-			s.mu.Unlock()
+			ptmx, _ := s.program(att)
 			if ptmx == nil {
 				return
 			}
@@ -443,9 +556,14 @@ func (s *server) handle(rwc io.ReadWriteCloser, remote string) {
 			}
 		case proto.TypeResize:
 			sz, err := proto.ParseSize(f.Payload)
-			if err == nil {
-				s.resize(sz, false)
+			if err != nil {
+				break
 			}
+			ptmx, cmd := s.program(att)
+			if ptmx == nil {
+				return
+			}
+			resizePty(ptmx, cmd, sz, false)
 		default:
 			log.Printf("ignoring frame type %d", f.Type)
 		}
