@@ -4,7 +4,8 @@ go 1.27.0
 
 require (
 	github.com/creack/pty v1.1.24
-	github.com/quic-go/quic-go v0.62.0
+	github.com/josephcopenhaver/tbdd-go v1.2.2
+	github.com/quic-go/quic-go v0.64.0
 	golang.org/x/sys v0.49.0
 	golang.org/x/term v0.47.0
 )

@@ -8,10 +8,13 @@
 //	rokey show-key
 //	rokey rotate-key
 //	rokey version
+//	rokey completion bash|zsh
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 
@@ -20,10 +23,14 @@ import (
 
 const (
 	projectName = "rokeydokey"
+	toolName    = "rokey"
 )
 
-func usage() {
-	fmt.Fprintf(os.Stderr, `%s - a keyed remote terminal
+func usage() { usageTo(os.Stderr) }
+
+// usageTo writes the help menu to w.
+func usageTo(w io.Writer) {
+	fmt.Fprintf(w, `%s - a keyed remote terminal
 (%s)
 
 Usage:
@@ -32,8 +39,11 @@ Usage:
   rokey show-key   Print your persistent public key fingerprint
   rokey rotate-key Generate a new persistent key pair, replacing the old one
   rokey version    Print the version
+  rokey completion Print tab completion for bash or zsh, for eval
 
 Run "rokey serve -h" or "rokey connect -h" for flags.
+Install completion with ". <(rokey completion bash)" in ~/.bashrc, or
+". <(rokey completion zsh)" in ~/.zshrc after compinit.
 
 Security:
   - ECDSA P-384 key pair for identity, stored in ~/.rokey/
@@ -61,6 +71,17 @@ func main() {
 		cmdRotateKey()
 	case "version":
 		fmt.Println(version)
+	case "completion":
+		if len(args) > 1 {
+			fatal("unexpected argument %q (usage: eval \"$(rokey completion bash)\")", args[1])
+		}
+		shell := ""
+		if len(args) > 0 {
+			shell = args[0]
+		}
+		exitOn(cmdCompletion(shell))
+	case "--complete": // hidden: the feed the generated completion scripts read
+		exitOn(cmdComplete(args))
 	case "help", "-h", "-help", "--help":
 		usage()
 	default:
@@ -87,6 +108,19 @@ func cmdRotateKey() {
 		fmt.Printf("Old fingerprint: %s\n", oldFP)
 	}
 	fmt.Printf("New fingerprint: %s\nKey pair rotated. Share the new fingerprint with your peers.\n", secure.Fingerprint(&key.PublicKey))
+}
+
+// exitOn ends the process with status 1 if err is non-nil. errSilent means the
+// command already delivered its complaint (see cmdCompletion), so only the
+// status is needed.
+func exitOn(err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, errSilent) {
+		os.Exit(1)
+	}
+	fatal("%v", err)
 }
 
 func fatal(format string, args ...any) {

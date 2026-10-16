@@ -30,6 +30,8 @@ shell, tmux, an editor, or anything else that runs in a terminal.
   program on first connect, and bridges the pty to the one connected client.
   `connect.go` puts the local terminal in raw mode, forwards keys and
   window-size changes, and writes the program's output to the screen.
+  `completion.go` holds the argument grammar and the bash and zsh tab
+  completion built on it.
 - `internal/secure` — identity keys, fingerprints, pinned mutual-TLS configs,
   QUIC listen/dial, and UDP hole punching. Adapted from bareshare (MIT).
 - `internal/proto` — the framing on the wire (type byte, length, payload).
@@ -177,6 +179,75 @@ can come back after its NAT has forgotten the previous session.
 `-network` on either side picks the address family: `udp4` (default), `udp6`,
 or `udp` for dual-stack. Any other value is rejected at startup. Both peers
 must be reachable over the family in use.
+
+## Shell completion
+
+```sh
+eval "$(rokey completion bash)"   # in ~/.bashrc
+. <(rokey completion zsh)         # in ~/.zshrc, AFTER compinit
+```
+
+The two forms differ on purpose. bash 3.2, which macOS still ships, reads
+nothing when it sources a pipe, so `. <(...)` would silently install nothing
+there; `eval` works in every bash. An interactive zsh, on the other hand, is
+not obliged to treat `#` as a comment inside an `eval`, so the zsh integration
+is sourced instead (and carries no comments at all, for the same reason).
+
+Commands complete at the first position. After `serve` and `connect` their
+flags complete, each offered once; `-transport` offers `quic` and `tcp`,
+`-network` offers `udp4`, `udp6` and `udp`, `-key-file` offers files, and
+`-cmd` offers programs on `$PATH`. After `serve ... --` the words belong to
+the hosted program and complete as files. `rokey completion` offers `bash`
+and `zsh`. Both `-flag value` and `-flag=value` are understood. Under zsh
+each command and flag also carries a one-line description. A port, an
+address, a fingerprint or a detach key offers nothing, because only you know
+it.
+
+Completion never reads or creates a key: a tab press cannot write
+`~/.rokey/key.pem`.
+
+### How the two shells stay in step
+
+The argument grammar lives once, in Go, in `cmd/rokey/completion.go`. Both
+scripts are thin adapters over the hidden
+
+```console
+$ rokey --complete zsh 3 -- rokey serve -transport ''
+words
+quic
+tcp
+```
+
+protocol: they hand rokey the words typed so far and the index of the one
+under the cursor, and translate the directive on the first line (`words`,
+`files`, `commands`, `none`) into `compgen`/`COMPREPLY` or
+`_describe`/`_files`/`_command_names`. Candidates come back unfiltered, so
+each shell applies its own matching, including whatever `zstyle` matcher a
+zsh user has configured.
+
+A second copy of that grammar written in shell would drift from the first and
+could only be tested through a shell; this way the catalogue in
+`completion.go` is the single place a new command or flag has to be declared,
+and a test fails if it and the real `flag.FlagSet`s or the help menu ever
+disagree.
+
+### Other shells
+
+Only bash and zsh are implemented. Any other argument (or none) prints an
+eval-safe complaint instead of a script and exits non-zero:
+
+```console
+$ eval "$(rokey completion fish)"; echo $?
+fish not supported
+1
+```
+
+The complaint is `>&2 echo "..." && false` rather than `... && exit 1`
+deliberately: you are eval'ing it in your interactive shell, where `exit`
+would close the terminal (or abort the rest of your rc file). `false` still
+leaves `$?` non-zero. The shell name is echoed back only when it is one rokey
+recognises; anything else reports `unknown shell specified`, so an argument
+can never smuggle text into the eval.
 
 ## Flags
 

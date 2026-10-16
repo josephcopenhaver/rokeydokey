@@ -47,6 +47,34 @@ func closeGrace() (time.Duration, error) {
 	return d, nil
 }
 
+// serveOpts holds the values of the `rokey serve` flags.
+type serveOpts struct {
+	transport, listen, network, peerKey, keyFile, peerAddr, program string
+	port                                                            int
+	restart                                                         bool
+}
+
+// serveFlagSet defines the `rokey serve` flags. It is separate from cmdServe
+// so the completion catalogue can be checked against the real flag set.
+func serveFlagSet() (*flag.FlagSet, *serveOpts) {
+	fs := flag.NewFlagSet("rokey serve", flag.ExitOnError)
+	o := &serveOpts{}
+	fs.StringVar(&o.transport, "transport", "quic", "transport: quic (mutual TLS over UDP) or tcp (plaintext)")
+	fs.StringVar(&o.listen, "listen", "127.0.0.1:7000", "tcp: address to listen on")
+	fs.IntVar(&o.port, "port", 0, "quic: UDP port to listen on (0 = random)")
+	fs.StringVar(&o.network, "network", "udp4", "quic: bind network: udp4, udp6, or udp (dual-stack)")
+	fs.StringVar(&o.peerKey, "peer-key", "", "quic: expected client fingerprint (required)")
+	fs.StringVar(&o.keyFile, "key-file", "", "quic: key file path (default: ephemeral, '.': persistent user key)")
+	fs.StringVar(&o.peerAddr, "peer-addr", "", "quic: client's public address (host:port) to hole punch toward")
+	fs.BoolVar(&o.restart, "restart", false, "keep serving after the program exits; the next client starts it again")
+	fs.StringVar(&o.program, "cmd", "", "program to host (default: $SHELL, then /bin/sh); arguments follow after --")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: rokey serve [flags] [-- program args...]\n\nflags:\n")
+		fs.PrintDefaults()
+	}
+	return fs, o
+}
+
 // cmdServe hosts a terminal program (the user's shell by default) inside a
 // pseudo-terminal and exposes it to one client at a time, over QUIC with
 // mutual TLS (default) or plain TCP. The program keeps running when the
@@ -54,23 +82,10 @@ func closeGrace() (time.Duration, error) {
 // The server exits when the program exits, unless -restart is set, in which
 // case the next client starts the program again.
 func cmdServe(args []string) {
-	fs := flag.NewFlagSet("rokey serve", flag.ExitOnError)
-	transport := fs.String("transport", "quic", "transport: quic (mutual TLS over UDP) or tcp (plaintext)")
-	listen := fs.String("listen", "127.0.0.1:7000", "tcp: address to listen on")
-	port := fs.Int("port", 0, "quic: UDP port to listen on (0 = random)")
-	network := fs.String("network", "udp4", "quic: bind network: udp4, udp6, or udp (dual-stack)")
-	peerKey := fs.String("peer-key", "", "quic: expected client fingerprint (required)")
-	keyFile := fs.String("key-file", "", "quic: key file path (default: ephemeral, '.': persistent user key)")
-	peerAddr := fs.String("peer-addr", "", "quic: client's public address (host:port) to hole punch toward")
-	restart := fs.Bool("restart", false, "keep serving after the program exits; the next client starts it again")
-	program := fs.String("cmd", "", "program to host (default: $SHELL, then /bin/sh); arguments follow after --")
-	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: rokey serve [flags] [-- program args...]\n\nflags:\n")
-		fs.PrintDefaults()
-	}
+	fs, o := serveFlagSet()
 	_ = fs.Parse(args)
 
-	bin, err := findProgram(*program)
+	bin, err := findProgram(o.program)
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -78,14 +93,14 @@ func cmdServe(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	srv := &server{bin: bin, args: fs.Args(), restart: *restart, done: make(chan int, 1), closeGrace: grace}
+	srv := &server{bin: bin, args: fs.Args(), restart: o.restart, done: make(chan int, 1), closeGrace: grace}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var closeTransport func()
-	switch *transport {
+	switch o.transport {
 	case "tcp":
-		ln, err := net.Listen("tcp", *listen)
+		ln, err := net.Listen("tcp", o.listen)
 		if err != nil {
 			fatal("%v", err)
 		}
@@ -93,33 +108,33 @@ func cmdServe(args []string) {
 		closeTransport = func() { ln.Close() }
 		go srv.acceptTCP(ln)
 	case "quic":
-		if *peerKey == "" {
+		if o.peerKey == "" {
 			fatal("-peer-key is required with the quic transport (run `rokey show-key` on the client)")
 		}
-		key, err := secure.LoadKey(*keyFile)
+		key, err := secure.LoadKey(o.keyFile)
 		if err != nil {
 			fatal("%v", err)
 		}
 		fmt.Fprintf(os.Stderr, "Your fingerprint: %s\n", secure.Fingerprint(&key.PublicKey))
 
-		tr, err := secure.NewTransport(*network, *port)
+		tr, err := secure.NewTransport(o.network, o.port)
 		if err != nil {
 			fatal("%v", err)
 		}
 		var punch *puncher
-		if *peerAddr != "" {
-			punch = newPuncher(ctx, tr, *network, *peerAddr)
+		if o.peerAddr != "" {
+			punch = newPuncher(ctx, tr, o.network, o.peerAddr)
 			punch.resume()
 		}
-		ln, err := tr.Listen(key, *peerKey)
+		ln, err := tr.Listen(key, o.peerKey)
 		if err != nil {
 			fatal("%v", err)
 		}
-		log.Printf("listening on %s port %d (quic, mutual TLS), program %s, args %q", *network, tr.LocalPort(), bin, fs.Args())
+		log.Printf("listening on %s port %d (quic, mutual TLS), program %s, args %q", o.network, tr.LocalPort(), bin, fs.Args())
 		closeTransport = func() { ln.Close(); tr.Close() }
 		go srv.acceptQUIC(ctx, ln, punch)
 	default:
-		fatal("invalid -transport %q: must be quic or tcp", *transport)
+		fatal("invalid -transport %q: must be quic or tcp", o.transport)
 	}
 
 	// Forward termination to the program so it can back up and exit cleanly;

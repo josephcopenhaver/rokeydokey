@@ -20,30 +20,45 @@ import (
 	"golang.org/x/term"
 )
 
+// connectOpts holds the values of the `rokey connect` flags.
+type connectOpts struct {
+	transport, addr, network, peerKey, keyFile, detachFlag string
+	port                                                   int
+}
+
+// connectFlagSet defines the `rokey connect` flags. It is separate from
+// cmdConnect so the completion catalogue can be checked against the real
+// flag set.
+func connectFlagSet() (*flag.FlagSet, *connectOpts) {
+	fs := flag.NewFlagSet("rokey connect", flag.ExitOnError)
+	o := &connectOpts{}
+	fs.StringVar(&o.transport, "transport", "quic", "transport: quic (mutual TLS over UDP) or tcp (plaintext)")
+	fs.StringVar(&o.addr, "peer-addr", "127.0.0.1:7000", "server address (host:port)")
+	fs.IntVar(&o.port, "port", 0, "quic: local UDP port (0 = random, set for bilateral punch)")
+	fs.StringVar(&o.network, "network", "udp4", "quic: bind network: udp4, udp6, or udp (dual-stack)")
+	fs.StringVar(&o.peerKey, "peer-key", "", "quic: expected server fingerprint (required)")
+	fs.StringVar(&o.keyFile, "key-file", ".", "quic: key file path ('': ephemeral, '.': persistent user key)")
+	fs.StringVar(&o.detachFlag, "detach-key", "0x1d", "byte that detaches the client (Ctrl-] by default); 'none' disables")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: rokey connect [flags]\n\nflags:\n")
+		fs.PrintDefaults()
+	}
+	return fs, o
+}
+
 // cmdConnect connects the local terminal to a rokey server, over QUIC with
 // mutual TLS (default) or plain TCP. Keys are forwarded verbatim; the detach
 // key (default Ctrl-]) closes the connection and leaves the program running
 // on the server.
 func cmdConnect(args []string) {
-	fs := flag.NewFlagSet("rokey connect", flag.ExitOnError)
-	transport := fs.String("transport", "quic", "transport: quic (mutual TLS over UDP) or tcp (plaintext)")
-	addr := fs.String("peer-addr", "127.0.0.1:7000", "server address (host:port)")
-	port := fs.Int("port", 0, "quic: local UDP port (0 = random, set for bilateral punch)")
-	network := fs.String("network", "udp4", "quic: bind network: udp4, udp6, or udp (dual-stack)")
-	peerKey := fs.String("peer-key", "", "quic: expected server fingerprint (required)")
-	keyFile := fs.String("key-file", ".", "quic: key file path ('': ephemeral, '.': persistent user key)")
-	detachFlag := fs.String("detach-key", "0x1d", "byte that detaches the client (Ctrl-] by default); 'none' disables")
-	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: rokey connect [flags]\n\nflags:\n")
-		fs.PrintDefaults()
-	}
+	fs, o := connectFlagSet()
 	_ = fs.Parse(args)
 
 	detach := -1
-	if *detachFlag != "none" {
-		v, err := strconv.ParseInt(*detachFlag, 0, 16)
+	if o.detachFlag != "none" {
+		v, err := strconv.ParseInt(o.detachFlag, 0, 16)
 		if err != nil || v < 0 || v > 255 {
-			fatal("bad -detach-key: %s", *detachFlag)
+			fatal("bad -detach-key: %s", o.detachFlag)
 		}
 		detach = int(v)
 	}
@@ -54,9 +69,9 @@ func cmdConnect(args []string) {
 
 	var rwc io.ReadWriteCloser
 	var closeTransport func()
-	switch *transport {
+	switch o.transport {
 	case "tcp":
-		conn, err := net.Dial("tcp", *addr)
+		conn, err := net.Dial("tcp", o.addr)
 		if err != nil {
 			fatal("connect: %v", err)
 		}
@@ -66,20 +81,20 @@ func cmdConnect(args []string) {
 		rwc = conn
 		closeTransport = func() { conn.Close() }
 	case "quic":
-		if *peerKey == "" {
+		if o.peerKey == "" {
 			fatal("-peer-key is required with the quic transport (the server prints its fingerprint at startup)")
 		}
-		key, err := secure.LoadKey(*keyFile)
+		key, err := secure.LoadKey(o.keyFile)
 		if err != nil {
 			fatal("%v", err)
 		}
 		fmt.Fprintf(os.Stderr, "Your fingerprint: %s\n", secure.Fingerprint(&key.PublicKey))
-		tr, err := secure.NewTransport(*network, *port)
+		tr, err := secure.NewTransport(o.network, o.port)
 		if err != nil {
 			fatal("%v", err)
 		}
-		fmt.Fprintf(os.Stderr, "Connecting to %s...\n", *addr)
-		qc, err := tr.Dial(context.Background(), 15*time.Second, *network, *addr, key, *peerKey)
+		fmt.Fprintf(os.Stderr, "Connecting to %s...\n", o.addr)
+		qc, err := tr.Dial(context.Background(), 15*time.Second, o.network, o.addr, key, o.peerKey)
 		if err != nil {
 			tr.Close()
 			fatal("connect: %v", err)
@@ -94,7 +109,7 @@ func cmdConnect(args []string) {
 			tr.Close()
 		}
 	default:
-		fatal("invalid -transport %q: must be quic or tcp", *transport)
+		fatal("invalid -transport %q: must be quic or tcp", o.transport)
 	}
 
 	w := proto.NewWriter(rwc)
@@ -156,7 +171,7 @@ func cmdConnect(args []string) {
 				if detach >= 0 {
 					for _, b := range buf[:n] {
 						if int(b) == detach {
-							exit(0, "detached; program still running on %s", *addr)
+							exit(0, "detached; program still running on %s", o.addr)
 						}
 					}
 				}
