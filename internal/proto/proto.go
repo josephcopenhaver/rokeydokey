@@ -22,11 +22,11 @@ import (
 
 // Frame types.
 const (
-	TypeData   uint8 = 0 // raw terminal bytes, either direction
-	TypeHello  uint8 = 1 // client -> server: initial size + TERM
-	TypeResize uint8 = 2 // client -> server: new window size
-	TypeExit   uint8 = 3 // server -> client: editor exited with code
-	TypeError  uint8 = 4 // server -> client: human readable error
+	TypeData   uint8 = iota // raw terminal bytes, either direction
+	TypeHello               // client -> server: initial size + TERM
+	TypeResize              // client -> server: new window size
+	TypeExit                // server -> client: editor exited with code
+	TypeError               // server -> client: human readable error
 )
 
 // MaxPayload bounds a single frame so a bad peer cannot force a huge allocation.

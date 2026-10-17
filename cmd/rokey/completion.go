@@ -21,24 +21,40 @@ import (
 
 // completeKind is the answer to "what does the word under the cursor accept?".
 // It is the first line of --complete's output; the adapters switch on it.
-type completeKind string
+type completeKind uint8
+
+const _completeKindEncodedValues = "nonewordsfilescommands"
 
 const (
-	_ completeKind = ""
+	completeNone completeKind = iota // "none" - nothing can be offered
 
-	completeNone     = "none"     // nothing can be offered
-	completeWords    = "words"    // the candidate lines that follow
-	completeFiles    = "files"    // whatever the shell calls a file
-	completeCommands = "commands" // programs on PATH
+	completeWords    // "words" - the candidate lines that follow
+	completeFiles    // "files" - whatever the shell calls a file
+	completeCommands // "commands" - programs on PATH
 )
 
+func (k completeKind) String() string {
+
+	switch k {
+	case completeNone:
+		return _completeKindEncodedValues[:4]
+	case completeWords:
+		return _completeKindEncodedValues[4:9]
+	case completeFiles:
+		return _completeKindEncodedValues[9:14]
+	case completeCommands:
+		return _completeKindEncodedValues[14:]
+	}
+
+	panic("completeKind.String: unknown kind")
+}
+
 // valueKind is what a flag's value, or a command's positional argument, accepts.
-type valueKind int
+type valueKind uint8
 
 const (
-	_ valueKind = iota - 1
+	valNothing valueKind = iota
 
-	valNothing // only the user knows it: a port, an address, a fingerprint
 	valWords   // one of a fixed set of words
 	valFile    // a path
 	valProgram // a program to run
@@ -199,7 +215,7 @@ func cmdComplete(args []string) error {
 
 	kind, cands := completeAt(words, cword)
 	var out bytes.Buffer
-	out.WriteString(string(kind))
+	out.WriteString(kind.String())
 	out.WriteByte('\n')
 	for _, c := range cands {
 		out.WriteString(c.word)
